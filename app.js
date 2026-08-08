@@ -37,6 +37,17 @@ function encodeWav(samples, sampleRate) {
   return new Blob([buf], { type: 'audio/wav' });
 }
 
+// Pausing is not enough: iOS only hands the audio session back to Apple Music
+// when the media element is actually torn down. Without this, your music stays
+// dead after the app stops talking.
+function releaseBed() {
+  try {
+    bedEl.pause();
+    bedEl.removeAttribute('src');
+    bedEl.load();
+  } catch (e) {}
+}
+
 function makeBed(bpm, group) {
   const sr = 22050;
   // whole number of accent groups so the loop point lands on a downbeat
@@ -61,7 +72,7 @@ function makeBed(bpm, group) {
 /* ------------------------------------------------------------------ app state */
 const S = {
   mode: 'pocket', distance: 15, pace: 600, structure: 'coached',
-  cadence: 175, accent: true, bedVol: 0.5,
+  cadence: 175, accent: true, bedVol: 0.5, bedOn: true,
   running: false, paused: false,
   t0: 0, pausedAt: 0, pausedMs: 0,
   timeline: null, idx: 0,
@@ -115,7 +126,7 @@ voiceEl.addEventListener('ended', playNextClip);
 voiceEl.addEventListener('error', playNextClip);
 
 function playNextClip() {
-  if (!vQueue.length) { bedEl.volume = S.bedVol; return; }
+  if (!vQueue.length) { if (S.bedOn) bedEl.volume = S.bedVol; return; }
   const url = vQueue.shift();
   if (!url) return playNextClip();
   voiceEl.src = url;
@@ -125,7 +136,7 @@ function playNextClip() {
 function speakClips(keys) {
   const urls = keys.map(k => S.clipUrls.get(k)).filter(Boolean);
   if (!urls.length) return;
-  bedEl.volume = S.bedVol * 0.18;          // duck the click under the voice
+  if (S.bedOn) bedEl.volume = S.bedVol * 0.18;   // duck the click under the voice
   vQueue = urls;
   try { voiceEl.pause(); } catch (e) {}
   playNextClip();
@@ -135,8 +146,10 @@ function speakLive(text) {
   if (!('speechSynthesis' in window)) return;
   const u = new SpeechSynthesisUtterance(text);
   u.rate = 1.02; u.pitch = 0.95; u.volume = 1;
-  bedEl.volume = S.bedVol * 0.18;
-  u.onend = () => { bedEl.volume = S.bedVol; };
+  if (S.bedOn) {
+    bedEl.volume = S.bedVol * 0.18;
+    u.onend = () => { bedEl.volume = S.bedVol; };
+  }
   speechSynthesis.cancel();
   speechSynthesis.speak(u);
 }
@@ -316,6 +329,10 @@ async function start() {
   S.cadence = parseInt($('fCadence').value, 10) || 175;
   S.accent = $('fAccent').checked;
   S.bedVol = parseInt($('fBedVol').value, 10) / 100;
+  // Pocket mode needs the bed — it's the continuously-playing element that keeps
+  // iOS from suspending us. Coach mode must NOT hold the audio session, or Apple
+  // Music gets interrupted and never resumes.
+  S.bedOn = S.mode === 'pocket' || ($('fClickCoach').checked && S.bedVol > 0);
 
   S.timeline = Engine.buildTimeline(S.distance, S.pace, S.structure);
   S.idx = 0; S.splits = []; S.lastCue = 'Getting started…';
@@ -323,9 +340,13 @@ async function start() {
 
   show('loading');
   // iOS requires audio to be kicked off inside the tap that started it
-  bedEl.src = S.bedUrl = makeBed(S.cadence, S.accent ? 5 : 0);
-  bedEl.volume = 0;
-  try { await bedEl.play(); } catch (e) { console.warn('bed play', e); }
+  if (S.bedOn) {
+    bedEl.src = S.bedUrl = makeBed(S.cadence, S.accent ? 5 : 0);
+    bedEl.volume = 0;
+    try { await bedEl.play(); } catch (e) { console.warn('bed play', e); }
+  } else {
+    releaseBed();
+  }
   // Prime the voice element inside the tap. Decode synchronously from the pack —
   // an await here can cost us the iOS user-activation window, and without that
   // priming the first cue of the run is silent.
@@ -346,7 +367,7 @@ async function start() {
     startGeo();
   }
 
-  bedEl.volume = S.bedVol;
+  if (S.bedOn) bedEl.volume = S.bedVol;
   S.t0 = Date.now(); S.pausedMs = 0; S.paused = false; S.running = true;
   show('run');
   render(0);
@@ -358,13 +379,13 @@ function togglePause() {
   if (S.paused) {
     S.pausedMs += Date.now() - S.pausedAt;
     S.paused = false;
-    bedEl.play().catch(() => {});
+    if (S.bedOn) bedEl.play().catch(() => {});
     $('bPause').textContent = 'Pause';
     if (S.mode === 'pocket') speakClips(['s_resumed']); else speakLive('Resuming.');
   } else {
     S.pausedAt = Date.now();
     S.paused = true;
-    bedEl.pause();
+    if (S.bedOn) bedEl.pause();
     $('bPause').textContent = 'Resume';
   }
 }
@@ -384,7 +405,8 @@ function tapSplit() {
 
 function finish() {
   S.running = false;
-  bedEl.pause();
+  releaseBed();
+  try { speechSynthesis.cancel(); } catch (e) {}
   if (S.geoId != null) navigator.geolocation.clearWatch(S.geoId);
   if (S.wakeLock) { try { S.wakeLock.release(); } catch (e) {} S.wakeLock = null; }
   const el = elapsed();
@@ -416,10 +438,14 @@ function updatePreview() {
   $('pvPlan').textContent = tl.plan.warm
     ? `warm up ${fmtPace(m[0])}–${fmtPace(m[tl.plan.warm - 1])} · goal ${fmtPace(p)} · close ${fmtPace(m[m.length - 1])}`
     : `flat ${fmtPace(p)} the whole way`;
-  $('fMode').value === 'pocket' ? $('modeNote').textContent =
-      'Screen can go off, phone in a pocket. Coach audio + cadence click only — this replaces Apple Music.'
-    : $('modeNote').textContent =
-      'Screen stays on (armband). Apple Music keeps playing, live voice on top, GPS pace. Music will dip for each cue.';
+  const coachMode = $('fMode').value === 'coach';
+  $('modeNote').textContent = coachMode
+    ? 'Screen stays on (armband). Apple Music keeps playing, live voice on top, GPS pace. Music dips for each cue, then comes back.'
+    : 'Screen can go off, phone in a pocket. Coach audio + cadence click only — this replaces Apple Music.';
+  $('clickCoachWrap').style.display = coachMode ? 'flex' : 'none';
+  $('cadenceNote').textContent = coachMode && !$('fClickCoach').checked
+    ? 'Click is off in Coach mode so your music keeps playing. Cadence still shows on screen as a target — 3 steps in, 2 steps out against 175.'
+    : 'Three steps in, two steps out. The odd count means your exhale lands on alternating feet instead of hammering the same side every stride — that\u2019s the single best injury-prevention lever in a long run.';
 }
 
 /* ------------------------------------------------------------------------ init */
@@ -432,18 +458,28 @@ window.addEventListener('DOMContentLoaded', () => {
     S.bedVol = parseInt($('fBedVol').value, 10) / 100;
     if (S.running) bedEl.volume = S.bedVol;
   });
+  $('fClickCoach').addEventListener('change', updatePreview);
   $('bStart').addEventListener('click', start);
   $('bPause').addEventListener('click', togglePause);
   $('bSplit').addEventListener('click', tapSplit);
   $('bStop').addEventListener('click', finish);
   $('bAgain').addEventListener('click', () => show('setup'));
   $('bTest').addEventListener('click', async () => {
-    await preload(['s_start', 'b_32_a', 'mile_8'], () => {});
+    const coachMode = $('fMode').value === 'coach';
+    const wantBed = !coachMode || ($('fClickCoach').checked && parseInt($('fBedVol').value, 10) > 0);
+    S.bedOn = wantBed;
+    if (coachMode && !wantBed) {
+      // Test exactly what a run will sound like: system voice only, no audio
+      // session held, so your music ducks and then comes straight back.
+      speakLive('Mile eight. You are right on plan. Three steps in, two steps out.');
+      return;
+    }
+    await preload(['b_32_a', 'mile_8'], () => {});
     bedEl.src = makeBed(parseInt($('fCadence').value, 10), $('fAccent').checked ? 5 : 0);
     bedEl.volume = parseInt($('fBedVol').value, 10) / 100;
     bedEl.play().catch(() => {});
     setTimeout(() => speakClips(['mile_8', 'b_32_a']), 1200);
-    setTimeout(() => { bedEl.pause(); }, 12000);
+    setTimeout(releaseBed, 12000);          // release, don't just pause
   });
   updatePreview();
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
