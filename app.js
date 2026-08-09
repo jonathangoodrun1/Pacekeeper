@@ -1,7 +1,15 @@
 /* PaceKeeper — runtime. Audio engine, run loop, UI wiring. */
 'use strict';
 
-const $ = id => document.getElementById(id);
+const $ = id => document.getElementById(id) || $missing(id);
+// A half-updated cache can pair an old index.html with a new app.js. Rather than
+// throwing on the first missing node and killing the app, hand back an inert stub.
+function $missing(id) {
+  console.warn('missing element:', id);
+  return { textContent: '', value: '', checked: false, style: {},
+           classList: { toggle(){}, add(){}, remove(){} },
+           addEventListener(){}, removeAttribute(){}, setAttribute(){} };
+}
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const fmtClock = s => {
   s = Math.max(0, Math.round(s));
@@ -449,7 +457,7 @@ function updatePreview() {
 }
 
 /* ------------------------------------------------------------------------ init */
-window.addEventListener('DOMContentLoaded', () => {
+function boot() {
   ['fDist', 'fPaceMin', 'fPaceSec', 'fStruct', 'fMode'].forEach(id =>
     $(id).addEventListener('input', updatePreview));
   $('fCadence').addEventListener('input', () => $('cadVal').textContent = $('fCadence').value + ' spm');
@@ -483,4 +491,30 @@ window.addEventListener('DOMContentLoaded', () => {
   });
   updatePreview();
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  try {
+    boot();
+  } catch (e) {
+    // Last resort: show the problem instead of a dead screen, and give a way out.
+    console.error('boot failed', e);
+    document.body.innerHTML =
+      '<div style="padding:32px;font:16px -apple-system,sans-serif;color:#f2f5f8">' +
+      '<h2 style="color:#ff8a3d">Update problem</h2>' +
+      '<p>The app files are out of sync — usually a half-finished cache update.</p>' +
+      '<p><button id="pkReset" style="width:100%;padding:18px;border:none;border-radius:14px;' +
+      'background:#ff8a3d;color:#12161a;font-weight:800;font-size:17px">Reset and reload</button></p>' +
+      '<p style="color:#8b96a3;font-size:13px">If this keeps happening, delete the home screen icon ' +
+      'and add it again from Safari.</p></div>';
+    document.getElementById('pkReset').onclick = async () => {
+      try {
+        const ks = await caches.keys();
+        await Promise.all(ks.map(k => caches.delete(k)));
+        const regs = await navigator.serviceWorker.getRegistrations();
+        await Promise.all(regs.map(r => r.unregister()));
+      } catch (err) {}
+      location.reload(true);
+    };
+  }
 });
