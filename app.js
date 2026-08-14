@@ -1,14 +1,24 @@
-/* PaceKeeper — runtime. Audio engine, run loop, UI wiring. */
+/* PaceKeeper — application shell.
+ *
+ * Layering (kept deliberately strict so each piece stays testable on its own):
+ *   engine.js  pure functions   pace plan + cue timeline, no DOM, no audio
+ *   audio.js   playback         pre-rendered session stream + music deck
+ *   app.js     this file        state, screens, run drivers, UI
+ *
+ * Two drivers implement the same tiny interface — time(), pause(), resume(),
+ * stop() — so the run screen never branches on mode:
+ *   PocketDriver  pre-rendered continuous stream. Survives a locked screen.
+ *   CoachDriver   live speech + GPS. Adaptive, needs the screen on.
+ */
 'use strict';
 
-const $ = id => document.getElementById(id) || $missing(id);
-// A half-updated cache can pair an old index.html with a new app.js. Rather than
-// throwing on the first missing node and killing the app, hand back an inert stub.
-function $missing(id) {
+/* ------------------------------------------------------------------ helpers */
+const $ = id => document.getElementById(id) || stub(id);
+function stub(id) {
   console.warn('missing element:', id);
-  return { textContent: '', value: '', checked: false, style: {},
-           classList: { toggle(){}, add(){}, remove(){} },
-           addEventListener(){}, removeAttribute(){}, setAttribute(){} };
+  return { textContent: '', value: '', checked: false, files: [], style: {},
+           classList: { toggle() {}, add() {}, remove() {} },
+           addEventListener() {}, removeAttribute() {}, setAttribute() {} };
 }
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const fmtClock = s => {
@@ -21,498 +31,406 @@ const fmtPace = s => {
   s = Math.round(s);
   return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
 };
+const show = screen =>
+  ['setup', 'loading', 'run', 'summary'].forEach(s =>
+    $('sc-' + s).classList.toggle('on', s === screen));
 
-/* ------------------------------------------------------------------ audio bed
-   The cadence metronome is generated in-browser as a WAV blob rather than
-   shipped as a file: MP3 has encoder padding, so a looped MP3 ticks with a gap
-   at the loop point. A WAV in a looping <audio> element is sample-exact, and
-   it's the continuously-playing media element that keeps iOS from suspending
-   the page in your pocket. */
-function encodeWav(samples, sampleRate) {
-  const n = samples.length;
-  const buf = new ArrayBuffer(44 + n * 2);
-  const dv = new DataView(buf);
-  const wr = (off, str) => { for (let i = 0; i < str.length; i++) dv.setUint8(off + i, str.charCodeAt(i)); };
-  wr(0, 'RIFF'); dv.setUint32(4, 36 + n * 2, true); wr(8, 'WAVEfmt ');
-  dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
-  dv.setUint32(24, sampleRate, true); dv.setUint32(28, sampleRate * 2, true);
-  dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
-  wr(36, 'data'); dv.setUint32(40, n * 2, true);
-  for (let i = 0; i < n; i++) {
-    const v = clamp(samples[i], -1, 1);
-    dv.setInt16(44 + i * 2, v < 0 ? v * 0x8000 : v * 0x7fff, true);
-  }
-  return new Blob([buf], { type: 'audio/wav' });
-}
-
-// Pausing is not enough: iOS only hands the audio session back to Apple Music
-// when the media element is actually torn down. Without this, your music stays
-// dead after the app stops talking.
-function releaseBed() {
-  try {
-    bedEl.pause();
-    bedEl.removeAttribute('src');
-    bedEl.load();
-  } catch (e) {}
-}
-
-function makeBed(bpm, group) {
-  const sr = 22050;
-  // whole number of accent groups so the loop point lands on a downbeat
-  const g = group || 1;
-  const beats = g * Math.max(1, Math.round(24 * bpm / 60 / g));
-  const N = Math.round(beats * 60 / bpm * sr);
-  const data = new Float32Array(N);
-  for (let b = 0; b < beats; b++) {
-    const accent = group > 0 && b % g === 0;
-    const f = accent ? 1350 : 880;
-    const amp = accent ? 0.55 : 0.30;
-    const decay = accent ? 0.008 : 0.005;
-    const start = Math.round(b * 60 / bpm * sr);
-    const len = Math.round(0.035 * sr);
-    for (let i = 0; i < len && start + i < N; i++) {
-      data[start + i] += amp * Math.exp(-i / (sr * decay)) * Math.sin(2 * Math.PI * f * i / sr);
-    }
-  }
-  return URL.createObjectURL(encodeWav(data, sr));
-}
-
-/* ------------------------------------------------------------------ app state */
+/* -------------------------------------------------------------------- state */
 const S = {
   mode: 'pocket', distance: 15, pace: 600, structure: 'coached',
-  cadence: 175, accent: true, bedVol: 0.5, bedOn: true,
+  cadence: 175, accent: true, clickVol: 0.5, musicVol: 0.7,
+  timeline: null, driver: null, music: null,
   running: false, paused: false,
-  t0: 0, pausedAt: 0, pausedMs: 0,
-  timeline: null, idx: 0,
-  clipUrls: new Map(), bedUrl: null,
-  wakeLock: null, geoId: null,
-  gps: { pts: [], dist: 0, ok: false },
-  splits: [], lastCue: '—',
+  splits: [], lastCue: 'Getting started…',
 };
 
-/* ---------------------------------------------------------------- clip loader */
-// Clips come from the inlined voice pack (voices.js). Decoding to real Blob
-// URLs rather than handing data: URLs straight to <audio> — iOS is far happier
-// seeking and chaining blob-backed media, especially with the screen locked.
-function b64ToBlob(b64) {
-  const bin = atob(b64);
-  const buf = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
-  return new Blob([buf], { type: 'audio/mpeg' });
+/* ------------------------------------------------------------ pocket driver */
+class PocketDriver {
+  constructor(timeline) { this.tl = timeline; }
+
+  async prepare(onProgress) {
+    this.audio = new SessionAudio({
+      cues: this.tl.cues, total: this.tl.total,
+      cadence: S.cadence, accent: S.accent,
+      clickGain: S.clickVol,
+      onCue: c => {
+        S.lastCue = c.text;
+        if (S.music) { S.music.duck(true); setTimeout(() => S.music.duck(false), 4200); }
+      },
+      onProgress: t => render(t),
+      onEnd: () => finish(),
+    });
+    await this.audio.decodeClips(window.PK_VOICES || {},
+      (a, b) => onProgress('Decoding coach audio', a, b));
+    await this.audio.prepare((a, b) => onProgress('Building your session', a, b));
+  }
+
+  async begin() { await this.audio.start(); if (S.music) await S.music.play(); }
+  time() { return this.audio.time(); }
+  pause() { this.audio.pause(); if (S.music) S.music.pause(); }
+  resume() { this.audio.resume(); if (S.music) S.music.resume(); }
+  stop() { this.audio.stop(); }
+  livePace() { return NaN; }
+  distance(t) { return plannedMile(t); }
 }
 
-async function preload(keys, onProgress) {
-  const uniq = [...new Set(keys)];
-  let done = 0;
-  for (const k of uniq) {
-    if (!S.clipUrls.has(k)) {
-      try {
-        const pack = window.PK_VOICES;
-        if (pack && pack[k]) {
-          S.clipUrls.set(k, URL.createObjectURL(b64ToBlob(pack[k])));
-        } else {
-          const r = await fetch('audio/' + k + '.mp3');   // fallback for dev
-          if (!r.ok) throw new Error(r.status);
-          S.clipUrls.set(k, URL.createObjectURL(await r.blob()));
-        }
-      } catch (e) { console.warn('clip failed', k, e); }
+/* ------------------------------------------------------------- coach driver */
+class CoachDriver {
+  constructor(timeline) {
+    this.tl = timeline;
+    this.gps = { pts: [], dist: 0, ok: false };
+    this.idx = 0; this.t0 = 0; this.pausedMs = 0; this.pausedAt = 0; this.isPaused = false;
+  }
+
+  async prepare(onProgress) {
+    onProgress('Getting location', 1, 2);
+    await this._wakeLock();
+    this._geo();
+    onProgress('Ready', 2, 2);
+  }
+
+  async begin() {
+    this.t0 = Date.now();
+    if (S.music) await S.music.play();
+    this.timer = setInterval(() => this._tick(), 500);
+    this._speak('Starting now. Ease into it. Goal pace ' + fmtPace(S.pace) + ' per mile.');
+  }
+
+  time() {
+    const base = this.isPaused ? this.pausedAt : Date.now();
+    return (base - this.t0 - this.pausedMs) / 1000;
+  }
+
+  _tick() {
+    if (this.isPaused) return;
+    const t = this.time();
+    let fire = null;
+    while (this.idx < this.tl.cues.length && this.tl.cues[this.idx].t <= t) {
+      const c = this.tl.cues[this.idx++];
+      if (t - c.t >= 40) continue;
+      if (!fire || c.pri > fire.pri || (c.pri === fire.pri && c.t >= fire.t)) fire = c;
     }
-    if (++done % 12 === 0) await new Promise(r => setTimeout(r, 0));  // keep UI alive
-    onProgress(done, uniq.length);
+    if (fire) { S.lastCue = fire.text; this._speak(this._text(fire, t)); }
+    render(t);
+    if (t > this.tl.total + 90) finish();
+  }
+
+  // Coach mode can speak real numbers, so it says more than the clip bank can.
+  _text(cue, t) {
+    if (cue.kind === 'split' && cue.clips[0] && cue.clips[0].startsWith('mile_')) {
+      const m = parseInt(cue.clips[0].split('_')[1], 10);
+      let s = 'Mile ' + m + '.';
+      const drift = this.drift(t);
+      if (isFinite(drift) && Math.abs(drift) > 8) {
+        s += drift > 0
+          ? ' You are ' + Math.round(drift) + ' seconds behind plan. Lift it slightly.'
+          : ' You are ' + Math.round(-drift) + ' seconds ahead. Ease off, that is banked.';
+      } else s += ' Right on plan.';
+      return s;
+    }
+    return cue.text;
+  }
+
+  _speak(text) {
+    if (!('speechSynthesis' in window)) return;
+    if (S.music) S.music.duck(true);
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = 1.02; u.pitch = 0.95;
+    u.onend = () => { if (S.music) S.music.duck(false); };
+    speechSynthesis.cancel();
+    speechSynthesis.speak(u);
+  }
+
+  async _wakeLock() {
+    try {
+      if ('wakeLock' in navigator) {
+        this.lock = await navigator.wakeLock.request('screen');
+        document.addEventListener('visibilitychange', async () => {
+          if (document.visibilityState === 'visible' && S.running) {
+            try { this.lock = await navigator.wakeLock.request('screen'); } catch (e) {}
+          }
+        });
+      }
+    } catch (e) { console.warn('wakelock', e); }
+  }
+
+  _geo() {
+    if (!navigator.geolocation) return;
+    this.watch = navigator.geolocation.watchPosition(pos => {
+      if (pos.coords.accuracy > 30) return;              // junk fix
+      const p = { lat: pos.coords.latitude, lon: pos.coords.longitude, t: pos.timestamp / 1000 };
+      const last = this.gps.pts[this.gps.pts.length - 1];
+      if (last) {
+        const d = haversine(last, p);
+        if (d > 0.0006 && d < 0.05) this.gps.dist += d;  // reject jitter and jumps
+      }
+      this.gps.pts.push(p);
+      this.gps.ok = true;
+      if (this.gps.pts.length > 400) this.gps.pts.splice(0, 200);
+    }, e => console.warn('geo', e), { enableHighAccuracy: true, maximumAge: 2000, timeout: 15000 });
+  }
+
+  // Raw GPS pace is unusably noisy; average over the last 30 seconds.
+  livePace() {
+    const pts = this.gps.pts;
+    if (pts.length < 4) return NaN;
+    const now = pts[pts.length - 1].t;
+    let i = pts.length - 1, d = 0;
+    while (i > 0 && now - pts[i - 1].t < 30) { d += haversine(pts[i - 1], pts[i]); i--; }
+    const dt = now - pts[i].t;
+    return (d < 0.004 || dt < 8) ? NaN : dt / d;
+  }
+
+  drift(t) {
+    if (!this.gps.ok || this.gps.dist < 0.2) return NaN;
+    const miles = this.tl.plan.miles;
+    let planned = 0, rem = this.gps.dist;
+    for (let i = 0; i < miles.length && rem > 0; i++) { planned += miles[i] * Math.min(1, rem); rem -= 1; }
+    return t - planned;
+  }
+
+  distance() { return this.gps.ok && this.gps.dist > 0.05 ? this.gps.dist : plannedMile(this.time()); }
+  pause() { this.pausedAt = Date.now(); this.isPaused = true; if (S.music) S.music.pause(); }
+  resume() { this.pausedMs += Date.now() - this.pausedAt; this.isPaused = false; if (S.music) S.music.resume(); }
+  stop() {
+    clearInterval(this.timer);
+    try { speechSynthesis.cancel(); } catch (e) {}
+    if (this.watch != null) navigator.geolocation.clearWatch(this.watch);
+    if (this.lock) { try { this.lock.release(); } catch (e) {} }
   }
 }
 
-/* --------------------------------------------------------------- voice output */
-const bedEl = new Audio();
-bedEl.loop = true;
-bedEl.preload = 'auto';
-const voiceEl = new Audio();
-voiceEl.preload = 'auto';
-let vQueue = [];
-
-voiceEl.addEventListener('ended', playNextClip);
-voiceEl.addEventListener('error', playNextClip);
-
-function playNextClip() {
-  if (!vQueue.length) { if (S.bedOn) bedEl.volume = S.bedVol; return; }
-  const url = vQueue.shift();
-  if (!url) return playNextClip();
-  voiceEl.src = url;
-  voiceEl.play().catch(playNextClip);
-}
-
-function speakClips(keys) {
-  const urls = keys.map(k => S.clipUrls.get(k)).filter(Boolean);
-  if (!urls.length) return;
-  if (S.bedOn) bedEl.volume = S.bedVol * 0.18;   // duck the click under the voice
-  vQueue = urls;
-  try { voiceEl.pause(); } catch (e) {}
-  playNextClip();
-}
-
-function speakLive(text) {
-  if (!('speechSynthesis' in window)) return;
-  const u = new SpeechSynthesisUtterance(text);
-  u.rate = 1.02; u.pitch = 0.95; u.volume = 1;
-  if (S.bedOn) {
-    bedEl.volume = S.bedVol * 0.18;
-    u.onend = () => { bedEl.volume = S.bedVol; };
-  }
-  speechSynthesis.cancel();
-  speechSynthesis.speak(u);
-}
-
-/* ------------------------------------------------------------------- geo (coach) */
 function haversine(a, b) {
-  const R = 3958.8, toR = Math.PI / 180;
-  const dLat = (b.lat - a.lat) * toR, dLon = (b.lon - a.lon) * toR;
+  const R = 3958.8, r = Math.PI / 180;
+  const dLat = (b.lat - a.lat) * r, dLon = (b.lon - a.lon) * r;
   const s = Math.sin(dLat / 2) ** 2 +
-            Math.cos(a.lat * toR) * Math.cos(b.lat * toR) * Math.sin(dLon / 2) ** 2;
+            Math.cos(a.lat * r) * Math.cos(b.lat * r) * Math.sin(dLon / 2) ** 2;
   return 2 * R * Math.asin(Math.sqrt(s));
 }
 
-function startGeo() {
-  if (!navigator.geolocation) return;
-  S.geoId = navigator.geolocation.watchPosition(pos => {
-    const acc = pos.coords.accuracy;
-    if (acc > 30) return;                       // junk fix, ignore
-    const p = { lat: pos.coords.latitude, lon: pos.coords.longitude, t: pos.timestamp / 1000 };
-    const last = S.gps.pts[S.gps.pts.length - 1];
-    if (last) {
-      const d = haversine(last, p);
-      if (d > 0.0006 && d < 0.05) S.gps.dist += d;   // reject GPS jitter and jumps
-    }
-    S.gps.pts.push(p);
-    S.gps.ok = true;
-    if (S.gps.pts.length > 400) S.gps.pts.splice(0, 200);
-  }, err => console.warn('geo', err), { enableHighAccuracy: true, maximumAge: 2000, timeout: 15000 });
-}
-
-// rolling 30-second pace, because instantaneous GPS pace is unusably noisy
-function rollingPace() {
-  const pts = S.gps.pts;
-  if (pts.length < 4) return NaN;
-  const now = pts[pts.length - 1].t;
-  let i = pts.length - 1, d = 0;
-  while (i > 0 && now - pts[i - 1].t < 30) { d += haversine(pts[i - 1], pts[i]); i--; }
-  const dt = now - pts[i].t;
-  if (d < 0.004 || dt < 8) return NaN;
-  return dt / d;
-}
-
-async function acquireWakeLock() {
-  try {
-    if ('wakeLock' in navigator) {
-      S.wakeLock = await navigator.wakeLock.request('screen');
-      document.addEventListener('visibilitychange', async () => {
-        if (document.visibilityState === 'visible' && S.running && S.mode === 'coach') {
-          try { S.wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
-        }
-      });
-    }
-  } catch (e) { console.warn('wakelock', e); }
-}
-
-/* ------------------------------------------------------------------- run loop */
-function elapsed() {
-  if (!S.running) return 0;
-  const base = S.paused ? S.pausedAt : Date.now();
-  return (base - S.t0 - S.pausedMs) / 1000;
-}
-
-function plannedMile(el) {
-  const cum = S.timeline.cum;
-  for (let m = 1; m < cum.length; m++) if (el < cum[m]) return m - 1 + (el - cum[m - 1]) / S.timeline.plan.miles[m - 1];
-  return S.timeline.plan.miles.length;
-}
-
-function tick() {
-  if (!S.running || S.paused) return;
-  const el = elapsed();
-
-  // Fire every cue that has come due. If iOS suspended us in a pocket, several
-  // may be due at once — rather than machine-gunning stale cues, play the one
-  // that matters most. Highest priority wins; ties go to the most recent, so a
-  // mile split or block transition never loses its slot to an encouragement.
-  let fire = null;
-  while (S.idx < S.timeline.cues.length && S.timeline.cues[S.idx].t <= el) {
-    const c = S.timeline.cues[S.idx++];
-    if (el - c.t >= 40) continue;                       // too stale to be useful
-    if (!fire || c.pri > fire.pri || (c.pri === fire.pri && c.t >= fire.t)) fire = c;
-  }
-  if (fire) {
-    S.lastCue = fire.text;
-    if (S.mode === 'pocket') speakClips(fire.clips);
-    else speakLive(coachText(fire, el));
-  }
-
-  render(el);
-  if (el > S.timeline.total + 90) finish();
-}
-
-// Coach mode can say real numbers, so it gets richer text than the clip bank.
-function coachText(cue, el) {
-  if (cue.kind === 'split' && cue.clips[0].startsWith('mile_')) {
-    const m = parseInt(cue.clips[0].split('_')[1], 10);
-    const sp = S.splits[m - 1];
-    let t = 'Mile ' + m + '.';
-    if (sp) t += ' Split ' + fmtPace(sp.split) + '.';
-    const drift = driftSeconds(el);
-    if (isFinite(drift) && Math.abs(drift) > 8) {
-      t += drift > 0 ? ' You are ' + Math.round(drift) + ' seconds behind plan. Lift it slightly.'
-                     : ' You are ' + Math.round(-drift) + ' seconds ahead. Ease off, that is banked.';
-    } else t += ' Right on plan.';
-    return t;
-  }
-  return cue.text;
-}
-
-function driftSeconds(el) {
-  if (!S.gps.ok || S.gps.dist < 0.2) return NaN;
+function plannedMile(t) {
   const cum = S.timeline.cum, miles = S.timeline.plan.miles;
-  const d = S.gps.dist;
-  let planned = 0, rem = d;
-  for (let i = 0; i < miles.length && rem > 0; i++) { planned += miles[i] * Math.min(1, rem); rem -= 1; }
-  return el - planned;   // positive = behind plan
+  for (let m = 1; m < cum.length; m++) {
+    if (t < cum[m]) return m - 1 + (t - cum[m - 1]) / miles[m - 1];
+  }
+  return miles.length;
 }
 
-/* ---------------------------------------------------------------------- render */
-function render(el) {
+/* ------------------------------------------------------------------- render */
+function render(t) {
   const T = S.timeline;
-  $('rTime').textContent = fmtClock(el);
-  const pm = plannedMile(el);
-  const useGps = S.mode === 'coach' && S.gps.ok && S.gps.dist > 0.05;
-  const dist = useGps ? S.gps.dist : pm;
-  $('rDist').textContent = dist.toFixed(2);
-  $('rDistLabel').textContent = useGps ? 'miles (GPS)' : 'miles (on plan)';
+  $('rTime').textContent = fmtClock(t);
 
+  const pm = plannedMile(t);
   const mi = clamp(Math.floor(pm), 0, T.plan.miles.length - 1);
+  const dist = S.driver ? S.driver.distance(t) : pm;
+  const gps = S.mode === 'coach' && S.driver && S.driver.gps && S.driver.gps.ok;
+  $('rDist').textContent = dist.toFixed(2);
+  $('rDistLabel').textContent = gps ? 'miles (GPS)' : 'miles (on plan)';
   $('rTarget').textContent = fmtPace(T.plan.miles[mi]);
-  const block = mi < T.plan.warm ? 'WARM UP'
-              : (T.plan.fin > 0 && mi >= T.plan.miles.length - T.plan.fin ? 'FINISH' : 'GOAL PACE');
-  $('rBlock').textContent = block;
-  $('rBreath').textContent = mi < T.plan.warm ? '3:3' : (block === 'FINISH' ? '2:1' : '3:2');
 
-  // Pocket mode has no GPS, so "actual pace" would sit at --:-- for 2.5 hours.
-  // Show time remaining there instead — the number you actually want mid-run.
+  const inFin = T.plan.fin > 0 && mi >= T.plan.miles.length - T.plan.fin;
+  const block = mi < T.plan.warm ? 'WARM UP' : (inFin ? 'FINISH' : 'GOAL PACE');
+  $('rBlock').textContent = block;
+  $('rBreath').textContent = mi < T.plan.warm ? '3:3' : (inFin ? '2:1' : '3:2');
+
   if (S.mode === 'coach') {
-    $('rActual').textContent = fmtPace(rollingPace());
+    $('rActual').textContent = fmtPace(S.driver ? S.driver.livePace() : NaN);
     $('rActualK').textContent = 'actual pace';
   } else {
-    $('rActual').textContent = fmtClock(Math.max(0, T.total - el));
+    $('rActual').textContent = fmtClock(Math.max(0, T.total - t));
     $('rActualK').textContent = 'remaining';
   }
   $('rCad').textContent = S.cadence;
 
-  const drift = driftSeconds(el);
   const chip = $('rStatus');
-  if (S.mode !== 'coach' || !isFinite(drift)) {
-    chip.textContent = 'ON PLAN'; chip.className = 'chip neutral';
-  } else if (Math.abs(drift) <= 10) {
-    chip.textContent = 'ON PACE'; chip.className = 'chip good';
-  } else if (drift > 0) {
-    chip.textContent = Math.round(drift) + 's BEHIND'; chip.className = 'chip warn';
-  } else {
-    chip.textContent = Math.round(-drift) + 's HOT'; chip.className = 'chip hot';
-  }
+  const drift = S.driver && S.driver.drift ? S.driver.drift(t) : NaN;
+  if (!isFinite(drift))            { chip.textContent = 'ON PLAN';  chip.className = 'chip neutral'; }
+  else if (Math.abs(drift) <= 10)  { chip.textContent = 'ON PACE';  chip.className = 'chip good'; }
+  else if (drift > 0)              { chip.textContent = Math.round(drift) + 's BEHIND'; chip.className = 'chip warn'; }
+  else                             { chip.textContent = Math.round(-drift) + 's HOT';   chip.className = 'chip hot'; }
 
   $('rCue').textContent = S.lastCue;
-  const pct = clamp(el / T.total * 100, 0, 100);
-  $('rBar').style.width = pct + '%';
-  const nx = S.timeline.cues[S.idx];
-  $('rNext').textContent = nx ? 'next cue in ' + fmtClock(Math.max(0, nx.t - el)) : 'finishing';
+  $('rBar').style.width = clamp(t / T.total * 100, 0, 100) + '%';
+  const next = T.cues.find(c => c.t > t);
+  $('rNext').textContent = next ? 'next cue in ' + fmtClock(next.t - t) : 'finishing';
 }
 
-/* ----------------------------------------------------------------- transitions */
-function tlKeys(tl) { return tl.cues.flatMap(c => c.clips); }
-
-async function start() {
-  const d = parseFloat($('fDist').value) || 15;
-  const pmin = parseInt($('fPaceMin').value, 10) || 10;
-  const psec = parseInt($('fPaceSec').value, 10) || 0;
-  S.distance = clamp(d, 0.5, 40);
-  S.pace = clamp(pmin * 60 + psec, 300, 840);
+/* --------------------------------------------------------------- transitions */
+function readSetup() {
+  S.distance = clamp(parseFloat($('fDist').value) || 15, 0.5, 40);
+  S.pace = clamp((parseInt($('fPaceMin').value, 10) || 10) * 60 +
+                 (parseInt($('fPaceSec').value, 10) || 0), 300, 840);
   S.structure = $('fStruct').value;
   S.mode = $('fMode').value;
   S.cadence = parseInt($('fCadence').value, 10) || 175;
   S.accent = $('fAccent').checked;
-  S.bedVol = parseInt($('fBedVol').value, 10) / 100;
-  // Pocket mode needs the bed — it's the continuously-playing element that keeps
-  // iOS from suspending us. Coach mode must NOT hold the audio session, or Apple
-  // Music gets interrupted and never resumes.
-  S.bedOn = S.mode === 'pocket' || ($('fClickCoach').checked && S.bedVol > 0);
+  S.clickVol = S.mode === 'pocket' ? parseInt($('fBedVol').value, 10) / 100 : 0;
+  S.musicVol = parseInt($('fMusicVol').value, 10) / 100;
+}
 
+async function start() {
+  readSetup();
   S.timeline = Engine.buildTimeline(S.distance, S.pace, S.structure);
-  S.idx = 0; S.splits = []; S.lastCue = 'Getting started…';
-  S.gps = { pts: [], dist: 0, ok: false };
+  S.splits = []; S.lastCue = 'Getting started…';
 
   show('loading');
-  // iOS requires audio to be kicked off inside the tap that started it
-  if (S.bedOn) {
-    bedEl.src = S.bedUrl = makeBed(S.cadence, S.accent ? 5 : 0);
-    bedEl.volume = 0;
-    try { await bedEl.play(); } catch (e) { console.warn('bed play', e); }
-  } else {
-    releaseBed();
-  }
-  // Prime the voice element inside the tap. Decode synchronously from the pack —
-  // an await here can cost us the iOS user-activation window, and without that
-  // priming the first cue of the run is silent.
-  if (!S.clipUrls.has('s_start') && window.PK_VOICES && window.PK_VOICES['s_start']) {
-    S.clipUrls.set('s_start', URL.createObjectURL(b64ToBlob(window.PK_VOICES['s_start'])));
-  }
-  const primer = S.clipUrls.get('s_start');
-  if (primer) { try { voiceEl.src = primer; await voiceEl.play(); voiceEl.pause(); } catch (e) {} }
-  if ('speechSynthesis' in window) { const u = new SpeechSynthesisUtterance(' '); u.volume = 0; speechSynthesis.speak(u); }
+  const onProgress = (label, a, b) => {
+    $('loadTxt').textContent = label + '  ' + a + ' / ' + b;
+    $('loadBar').style.width = (a / b * 100) + '%';
+  };
 
-  if (S.mode === 'pocket') {
-    await preload(tlKeys(S.timeline), (a, b) => {
-      $('loadBar').style.width = (a / b * 100) + '%';
-      $('loadTxt').textContent = 'Loading coach audio  ' + a + ' / ' + b;
-    });
+  // Music, if the user picked any. Must be kicked off inside the tap on iOS.
+  const files = $('fMusic').files;
+  if (files && files.length) {
+    S.music = new MusicDeck();
+    S.music.load(files);
+    S.music.setVolume(S.musicVol);
   } else {
-    await acquireWakeLock();
-    startGeo();
+    S.music = null;
   }
 
-  if (S.bedOn) bedEl.volume = S.bedVol;
-  S.t0 = Date.now(); S.pausedMs = 0; S.paused = false; S.running = true;
+  try {
+    S.driver = S.mode === 'pocket' ? new PocketDriver(S.timeline) : new CoachDriver(S.timeline);
+    await S.driver.prepare(onProgress);
+    await S.driver.begin();
+  } catch (e) {
+    console.error('start failed', e);
+    $('loadTxt').textContent = 'Could not start audio — tap Start again.';
+    show('setup');
+    return;
+  }
+
+  S.running = true; S.paused = false;
+  $('bPause').textContent = 'Pause';
   show('run');
   render(0);
-  setInterval(tick, window.__PK_TICK || 500);
+  // Foreground-only heartbeat. Pocket mode does not depend on this for cues —
+  // the audio stream carries them — it just keeps the display honest.
+  clearInterval(S._ui);
+  S._ui = setInterval(() => { if (S.running && !S.paused) render(S.driver.time()); }, 1000);
 }
 
 function togglePause() {
   if (!S.running) return;
-  if (S.paused) {
-    S.pausedMs += Date.now() - S.pausedAt;
-    S.paused = false;
-    if (S.bedOn) bedEl.play().catch(() => {});
-    $('bPause').textContent = 'Pause';
-    if (S.mode === 'pocket') speakClips(['s_resumed']); else speakLive('Resuming.');
-  } else {
-    S.pausedAt = Date.now();
-    S.paused = true;
-    if (S.bedOn) bedEl.pause();
-    $('bPause').textContent = 'Resume';
-  }
+  S.paused = !S.paused;
+  S.paused ? S.driver.pause() : S.driver.resume();
+  $('bPause').textContent = S.paused ? 'Resume' : 'Pause';
 }
 
 function tapSplit() {
-  const el = elapsed();
+  if (!S.running) return;
+  const t = S.driver.time();
   const prev = S.splits.length ? S.splits[S.splits.length - 1].at : 0;
-  S.splits.push({ at: el, split: el - prev });
-  const n = S.splits.length;
-  if (S.mode === 'coach') {
-    speakLive('Manual split. Mile ' + n + '. ' + fmtPace(el - prev) + '.');
-  } else {
-    speakClips(['mile_' + Math.min(n, 40)]);
-  }
-  S.lastCue = 'Manual split at mile ' + n + ' — ' + fmtPace(el - prev);
+  S.splits.push({ at: t, split: t - prev });
+  S.lastCue = 'Manual split — mile ' + S.splits.length + ' in ' + fmtPace(t - prev);
+  render(t);
 }
 
 function finish() {
+  if (!S.running) return;
   S.running = false;
-  releaseBed();
-  try { speechSynthesis.cancel(); } catch (e) {}
-  if (S.geoId != null) navigator.geolocation.clearWatch(S.geoId);
-  if (S.wakeLock) { try { S.wakeLock.release(); } catch (e) {} S.wakeLock = null; }
-  const el = elapsed();
-  const dist = S.mode === 'coach' && S.gps.ok && S.gps.dist > 0.05 ? S.gps.dist : S.distance;
-  $('sumTime').textContent = fmtClock(el);
+  clearInterval(S._ui);
+  const t = S.driver ? S.driver.time() : 0;
+  const dist = S.driver ? S.driver.distance(t) : S.distance;
+  if (S.driver) S.driver.stop();
+  if (S.music) { S.music.stop(); S.music = null; }
+
+  $('sumTime').textContent = fmtClock(t);
   $('sumDist').textContent = dist.toFixed(2) + ' mi';
-  $('sumPace').textContent = fmtPace(el / Math.max(0.01, dist)) + ' /mi';
+  $('sumPace').textContent = fmtPace(t / Math.max(0.01, dist)) + ' /mi';
   $('sumPlan').textContent = fmtClock(S.timeline.total) + ' planned';
   show('summary');
+
   try {
     const log = JSON.parse(localStorage.getItem('pk_log') || '[]');
-    log.unshift({ d: new Date().toISOString(), dist, time: el, pace: el / Math.max(0.01, dist), mode: S.mode });
+    log.unshift({ d: new Date().toISOString(), dist, time: t, mode: S.mode });
     localStorage.setItem('pk_log', JSON.stringify(log.slice(0, 60)));
   } catch (e) {}
 }
 
-function show(screen) {
-  ['setup', 'loading', 'run', 'summary'].forEach(s => $('sc-' + s).classList.toggle('on', s === screen));
-}
-
-/* --------------------------------------------------------------------- preview */
+/* ------------------------------------------------------------------ preview */
 function updatePreview() {
   const d = clamp(parseFloat($('fDist').value) || 15, 0.5, 40);
-  const p = clamp((parseInt($('fPaceMin').value, 10) || 10) * 60 + (parseInt($('fPaceSec').value, 10) || 0), 300, 840);
+  const p = clamp((parseInt($('fPaceMin').value, 10) || 10) * 60 +
+                  (parseInt($('fPaceSec').value, 10) || 0), 300, 840);
   const tl = Engine.buildTimeline(d, p, $('fStruct').value);
-  $('pvTime').textContent = fmtClock(tl.total);
-  $('pvCues').textContent = tl.cues.length + ' cues · talks every ~' + Math.round(tl.total / tl.cues.length) + 's';
   const m = tl.plan.miles;
+  $('pvTime').textContent = fmtClock(tl.total);
+  $('pvCues').textContent = tl.cues.length + ' cues · talks every ~' +
+                            Math.round(tl.total / tl.cues.length) + 's';
   $('pvPlan').textContent = tl.plan.warm
     ? `warm up ${fmtPace(m[0])}–${fmtPace(m[tl.plan.warm - 1])} · goal ${fmtPace(p)} · close ${fmtPace(m[m.length - 1])}`
     : `flat ${fmtPace(p)} the whole way`;
-  const coachMode = $('fMode').value === 'coach';
-  $('modeNote').textContent = coachMode
-    ? 'Screen stays on (armband). Apple Music keeps playing, live voice on top, GPS pace. Music dips for each cue, then comes back.'
-    : 'Screen can go off, phone in a pocket. Coach audio + cadence click only — this replaces Apple Music.';
-  $('clickCoachWrap').style.display = coachMode ? 'flex' : 'none';
-  $('cadenceNote').textContent = coachMode && !$('fClickCoach').checked
-    ? 'Click is off in Coach mode so your music keeps playing. Cadence still shows on screen as a target — 3 steps in, 2 steps out against 175.'
-    : 'Three steps in, two steps out. The odd count means your exhale lands on alternating feet instead of hammering the same side every stride — that\u2019s the single best injury-prevention lever in a long run.';
+
+  const pocket = $('fMode').value === 'pocket';
+  $('modeNote').textContent = pocket
+    ? 'Screen off, phone anywhere. The whole session is pre-rendered and played as one continuous track, so nothing can be suspended mid-run.'
+    : 'Screen stays on (armband). Live GPS pace and real split times, and the coach adapts to how you are actually running.';
+  $('clickWrap').style.display = pocket ? 'block' : 'none';
+
+  const n = ($('fMusic').files || []).length;
+  $('musicCount').textContent = n ? n + ' track' + (n > 1 ? 's' : '') + ' loaded' : 'No tracks — coach only';
 }
 
-/* ------------------------------------------------------------------------ init */
+/* --------------------------------------------------------------------- boot */
 function boot() {
   ['fDist', 'fPaceMin', 'fPaceSec', 'fStruct', 'fMode'].forEach(id =>
     $(id).addEventListener('input', updatePreview));
+  $('fMusic').addEventListener('change', updatePreview);
   $('fCadence').addEventListener('input', () => $('cadVal').textContent = $('fCadence').value + ' spm');
-  $('fBedVol').addEventListener('input', () => {
-    $('volVal').textContent = $('fBedVol').value + '%';
-    S.bedVol = parseInt($('fBedVol').value, 10) / 100;
-    if (S.running) bedEl.volume = S.bedVol;
+  $('fBedVol').addEventListener('input', () => $('volVal').textContent = $('fBedVol').value + '%');
+  $('fMusicVol').addEventListener('input', () => {
+    $('musVal').textContent = $('fMusicVol').value + '%';
+    if (S.music) S.music.setVolume(parseInt($('fMusicVol').value, 10) / 100);
   });
-  $('fClickCoach').addEventListener('change', updatePreview);
   $('bStart').addEventListener('click', start);
   $('bPause').addEventListener('click', togglePause);
   $('bSplit').addEventListener('click', tapSplit);
   $('bStop').addEventListener('click', finish);
   $('bAgain').addEventListener('click', () => show('setup'));
-  $('bTest').addEventListener('click', async () => {
-    const coachMode = $('fMode').value === 'coach';
-    const wantBed = !coachMode || ($('fClickCoach').checked && parseInt($('fBedVol').value, 10) > 0);
-    S.bedOn = wantBed;
-    if (coachMode && !wantBed) {
-      // Test exactly what a run will sound like: system voice only, no audio
-      // session held, so your music ducks and then comes straight back.
-      speakLive('Mile eight. You are right on plan. Three steps in, two steps out.');
-      return;
-    }
-    await preload(['b_32_a', 'mile_8'], () => {});
-    bedEl.src = makeBed(parseInt($('fCadence').value, 10), $('fAccent').checked ? 5 : 0);
-    bedEl.volume = parseInt($('fBedVol').value, 10) / 100;
-    bedEl.play().catch(() => {});
-    setTimeout(() => speakClips(['mile_8', 'b_32_a']), 1200);
-    setTimeout(releaseBed, 12000);          // release, don't just pause
-  });
+  $('bTest').addEventListener('click', testAudio);
   updatePreview();
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
 }
 
-window.addEventListener('DOMContentLoaded', () => {
+// A 12-second sample of exactly what the run will sound like, built with the
+// same renderer — so if the test sounds right, the run will too.
+async function testAudio() {
+  readSetup();
+  const btn = $('bTest');
+  btn.textContent = 'Building…';
   try {
-    boot();
+    const demo = new SessionAudio({
+      cues: [{ t: 1.5, pri: 9, kind: 'demo', clips: ['mile_8', 'b_32_a'], text: 'demo' }],
+      total: 13, cadence: S.cadence, accent: S.accent,
+      clickGain: S.mode === 'pocket' ? S.clickVol : 0,
+      onEnd: () => { demo.stop(); btn.textContent = 'Test audio (12 sec)'; },
+    });
+    await demo.decodeClips(window.PK_VOICES || {}, () => {});
+    await demo.prepare(() => {});
+    await demo.start();
+    btn.textContent = 'Playing…';
+    setTimeout(() => { demo.stop(); btn.textContent = 'Test audio (12 sec)'; }, 13500);
   } catch (e) {
-    // Last resort: show the problem instead of a dead screen, and give a way out.
+    console.warn('test failed', e);
+    btn.textContent = 'Test audio (12 sec)';
+  }
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  try { boot(); } catch (e) {
     console.error('boot failed', e);
     document.body.innerHTML =
       '<div style="padding:32px;font:16px -apple-system,sans-serif;color:#f2f5f8">' +
       '<h2 style="color:#ff8a3d">Update problem</h2>' +
       '<p>The app files are out of sync — usually a half-finished cache update.</p>' +
-      '<p><button id="pkReset" style="width:100%;padding:18px;border:none;border-radius:14px;' +
-      'background:#ff8a3d;color:#12161a;font-weight:800;font-size:17px">Reset and reload</button></p>' +
-      '<p style="color:#8b96a3;font-size:13px">If this keeps happening, delete the home screen icon ' +
-      'and add it again from Safari.</p></div>';
+      '<button id="pkReset" style="width:100%;padding:18px;border:none;border-radius:14px;' +
+      'background:#ff8a3d;color:#12161a;font-weight:800;font-size:17px">Reset and reload</button></div>';
     document.getElementById('pkReset').onclick = async () => {
       try {
-        const ks = await caches.keys();
-        await Promise.all(ks.map(k => caches.delete(k)));
-        const regs = await navigator.serviceWorker.getRegistrations();
-        await Promise.all(regs.map(r => r.unregister()));
+        await Promise.all((await caches.keys()).map(k => caches.delete(k)));
+        await Promise.all((await navigator.serviceWorker.getRegistrations()).map(r => r.unregister()));
       } catch (err) {}
       location.reload(true);
     };

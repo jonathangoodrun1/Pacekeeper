@@ -1,8 +1,8 @@
 /* PaceKeeper service worker — full offline. You lose signal on a long run;
    the app must not care. The voice pack is inlined in voices.js, so the whole
    app is nine files. */
-const CACHE = 'pacekeeper-v4';
-const ASSETS = ["./","index.html","engine.js","voices.js","app.js","manifest.json",
+const CACHE = 'pacekeeper-v5';
+const ASSETS = ["./","index.html","engine.js","voices.js","audio.js","app.js","manifest.json",
                 "icon-180.png","icon-192.png","icon-512.png"];
 
 self.addEventListener('install', e => {
